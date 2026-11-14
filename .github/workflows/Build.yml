@@ -34,6 +34,14 @@ on:
         description: "Ship built .ko files in the zip (experimental, off = keep stock vendor modules)"
         type: boolean
         default: false
+      patch_urls:
+        description: "Extra patches: raw .patch/.diff URLs, space or newline separated (applied in order, build fails if one does not apply)"
+        required: false
+        default: ""
+      cherry_picks:
+        description: "Commit SHAs to cherry-pick from AOSP kernel/common android-4.19-stable, space separated (build fails if one does not apply)"
+        required: false
+        default: ""
       release:
         description: "Publish a GitHub Release"
         type: boolean
@@ -173,7 +181,7 @@ jobs:
               BT_PLATFORM=6877 WLAN_CHIP_ID=6877 \
               MTK_ANDROID_WMT=y MTK_ANDROID_EMI=y WIFI_IP_SET=1 \
               MTK_WLAN_SERVICE=yes CONNAC_VER=2_0 CFG_BUILD_CONNAC2=true \
-              KCFLAGS="-Wno-error -Wno-deprecated-declarations" \
+              KCFLAGS="-Wno-error -Wno-deprecated-declarations -Wno-unused-function -Wno-unused-variable -Wno-unused-label -Wno-unused-but-set-variable -Wno-declaration-after-statement -Wno-macro-redefined -Wno-logical-op-parentheses -Wno-compare-distinct-pointer-types -Wno-#pragma-messages -Wno-excess-initializers" \
               "$@"
           }
           EOF
@@ -187,6 +195,60 @@ jobs:
           path: ~/.ccache
           key: ccache-x6815c-${{ github.run_id }}
           restore-keys: ccache-x6815c-
+
+      - name: Fix known source issues (Kconfig, Makefiles, firmware)
+        working-directory: kernel
+        run: |
+          set -e
+
+          # set_type FILE SYMBOL TYPE: change the type keyword of "config SYMBOL"
+          # so a duplicate definition matches the one Kconfig already uses
+          # (silences "ignoring type redefinition" with no behaviour change).
+          set_type() {
+            [ -f "$1" ] || { echo "skip (missing): $1"; return 0; }
+            awk -v sym="$2" -v ty="$3" '
+              $0 ~ "^config[ \t]+" sym "[ \t]*$" { hit=1; print; next }
+              hit && /^[ \t]+(bool|tristate)[ \t]*"/ { sub(/(bool|tristate)/, ty); hit=0 }
+              /^(config|menuconfig|menu|endmenu|if|endif|choice|endchoice|source)/ { hit=0 }
+              { print }' "$1" > "$1.new" && mv "$1.new" "$1"
+            echo "Kconfig: $2 -> $3 in $1"
+          }
+
+          # Goodix Kconfig has CRLF line endings ("ignoring unsupported character")
+          F=drivers/input/touchscreen/goodix_9916r/Kconfig
+          [ -f "$F" ] && sed -i 's/\r$//' "$F" && echo "Kconfig: stripped CRLF in $F"
+
+          # Unterminated quote ("multi-line strings not supported")
+          F=drivers/input/misc/Kconfig
+          [ -f "$F" ] && sed -i 's|^source "drivers/input/misc/aw8697_haptic/Kconfig$|source "drivers/input/misc/aw8697_haptic/Kconfig"|' "$F"
+
+          # Duplicate symbols defined with different types
+          set_type drivers/misc/mediatek/base/power/Kconfig        MTK_QOS_FRAMEWORK tristate
+          set_type drivers/power/supply/mediatek/charger/Kconfig   CHARGER_BQ25890   tristate
+          set_type drivers/soc/mediatek/Kconfig                    MTK_CMDQ          bool
+
+          # "defined with blank help text"
+          F=sound/soc/codecs/aw882xx/Kconfig
+          if [ -f "$F" ] && [ "$(grep -v '^[[:space:]]*$' "$F" | tail -n1 | tr -d '[:space:]')" = "help" ]; then
+            printf '\t  Say Y or M here to support Awinic AW882XX smart PA amplifiers.\n' >> "$F"
+            echo "Kconfig: added help text to $F"
+          fi
+
+          # Makefile typos ("extraneous text after else/ifeq")
+          F=drivers/misc/mediatek/base/power/qos/Makefile
+          [ -f "$F" ] && sed -i 's/else ifeq(\$(/else ifeq ($(/' "$F"
+          F=drivers/misc/mediatek/base/power/upower_v2/Makefile
+          [ -f "$F" ] && sed -i 's/^ifeq (\$(CONFIG_MACH_MT6768),y))[[:space:]]*$/ifeq ($(CONFIG_MACH_MT6768),y)/' "$F"
+
+          # KernelSU is vendored (not a submodule): the default version is fine, so make it an info line
+          F=drivers/kernelsu/Makefile
+          [ -f "$F" ] && sed -i 's/^\$(warning "KSU_GIT_VERSION/$(info "KSU_GIT_VERSION/' "$F"
+
+          # Firmware: *.bin is gitignored, so files like novatek_ts_fw.bin never reach the repo.
+          # Anything you place in firmware/ of the workflow repo is copied in here.
+          if [ -d "$GITHUB_WORKSPACE/firmware" ]; then
+            cp -v "$GITHUB_WORKSPACE"/firmware/* firmware/ || true
+          fi
 
       - name: Apply BPF patches (optional, patches/bpf/*.patch)
         if: ${{ inputs.enable_bpf }}
@@ -208,6 +270,52 @@ jobs:
             fi
           done
 
+      - name: Apply extra patches (patch_urls / cherry_picks inputs)
+        if: ${{ inputs.patch_urls != '' || inputs.cherry_picks != '' }}
+        working-directory: kernel
+        env:
+          PATCH_URLS: ${{ inputs.patch_urls }}
+          CHERRY_PICKS: ${{ inputs.cherry_picks }}
+        run: |
+          set -e
+          git config user.name  "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+
+          apply_one() {   # $1 = patch file, $2 = label
+            if git apply --check "$1" 2>/dev/null; then
+              git apply "$1"
+            elif git apply --3way "$1" 2>/dev/null; then
+              echo "(applied with 3-way merge)"
+            else
+              echo "::error::Patch does not apply: $2"
+              git apply --check "$1" || true
+              exit 1
+            fi
+            echo "Applied: $2"
+          }
+
+          mkdir -p "$RUNNER_TEMP/extra"
+          N=0
+          for url in $PATCH_URLS; do
+            N=$((N+1))
+            f="$RUNNER_TEMP/extra/$(printf '%03d' "$N").patch"
+            curl -fsSL --retry 3 "$url" -o "$f" || { echo "::error::Download failed: $url"; exit 1; }
+            apply_one "$f" "$url"
+          done
+
+          if [ -n "$CHERRY_PICKS" ]; then
+            git remote add aosp https://android.googlesource.com/kernel/common
+            for sha in $CHERRY_PICKS; do
+              # depth 2 so the commit's parent is available to build the diff
+              git fetch --depth=2 aosp "$sha" || { echo "::error::Cannot fetch $sha from AOSP kernel/common"; exit 1; }
+              N=$((N+1))
+              f="$RUNNER_TEMP/extra/$(printf '%03d' "$N")-$sha.patch"
+              git diff FETCH_HEAD~1 FETCH_HEAD > "$f"
+              [ -s "$f" ] || { echo "::error::Empty diff for $sha"; exit 1; }
+              apply_one "$f" "cherry-pick $sha ($(git log -1 --format=%s FETCH_HEAD))"
+            done
+          fi
+
       - name: Configure kernel
         working-directory: kernel
         env:
@@ -227,7 +335,26 @@ jobs:
 
           kmake "$DEFCONFIG"
 
+          # Built-in firmware that is not in the tree breaks the build
+          # ("No rule to make target firmware/novatek_ts_fw.bin"). Drop missing files from
+          # CONFIG_EXTRA_FIRMWARE. The touch driver then loads it at runtime
+          # (it only needs it if the bootloader did not preload the IC).
+          FWDIR=$(sed -n 's/^CONFIG_EXTRA_FIRMWARE_DIR="\(.*\)"/\1/p' out/.config)
+          FWLIST=$(sed -n 's/^CONFIG_EXTRA_FIRMWARE="\(.*\)"/\1/p' out/.config)
+          KEEP=""
+          for f in $FWLIST; do
+            if [ -f "${FWDIR:-firmware}/$f" ]; then
+              KEEP="$KEEP $f"
+            else
+              echo "::warning::Built-in firmware '$f' is missing from ${FWDIR:-firmware}/, removing it from CONFIG_EXTRA_FIRMWARE (add it to firmware/ in the workflow repo to embed it)"
+            fi
+          done
+          KEEP="${KEEP# }"
+          : > fw.config
+          [ "$KEEP" != "$FWLIST" ] && echo "CONFIG_EXTRA_FIRMWARE=\"$KEEP\"" > fw.config
+
           FRAGS=()
+          [ -s fw.config ] && FRAGS+=(fw.config)
           # The port's own fragment (ACCDET dup-symbol fix, MI_HARDWARE_ID / get_hw_sku, SCS off, ...)
           [ -f x6815c-port/configs/X6815C_lineage.config ] && FRAGS+=(x6815c-port/configs/X6815C_lineage.config)
           FRAGS+=(ci.config)
@@ -287,7 +414,11 @@ jobs:
           TARGETS=(Image.gz modules)
           [ "$INC_DTB" = "true" ] && TARGETS+=(dtbs)
 
-          kmake -j"$(nproc)" "${TARGETS[@]}" 2>&1 | tee build.log
+          # "LLVM ERROR: IO failure on output stream: Broken pipe" is harmless noise from
+          # Makefile probes like `clang ... | grep -q`; drop just those lines.
+          kmake -j"$(nproc)" "${TARGETS[@]}" 2>&1 \
+            | sed -u '/LLVM ERROR: IO failure on output stream: Broken pipe/d' \
+            | tee build.log
 
           ccache -s
 
