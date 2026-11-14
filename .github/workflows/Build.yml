@@ -12,11 +12,11 @@ on:
         required: false
         default: "main"
       defconfig:
-        description: "Defconfig name (blank = auto-detect, list is printed in the log)"
+        description: "Defconfig name (blank = X6815C_defconfig)"
         required: false
         default: ""
       toolchain:
-        description: "Clang toolchain (aosp = r383902 / Clang 11, falls back to proton if download fails)"
+        description: "Clang toolchain (aosp = r383902 / Clang 11.0.1 like the stock kernel; proton is a fallback and may break module ABI)"
         type: choice
         options:
           - aosp
@@ -27,15 +27,11 @@ on:
         type: boolean
         default: true
       include_dtb:
-        description: "Ship the built dtb in the zip (off = keep the stock dtb)"
+        description: "Replace the zip's dtb with the one built from source (off = keep the dtb shipped in the repo's AnyKernel3)"
         type: boolean
         default: false
       include_modules:
         description: "Ship built .ko files in the zip (experimental, off = keep stock vendor modules)"
-        type: boolean
-        default: false
-      wlan_fix:
-        description: "Apply the old blind WLAN/HIF Makefile + config fix (only if WLAN build fails)"
         type: boolean
         default: false
       release:
@@ -47,13 +43,13 @@ permissions:
   contents: write
 
 env:
-  ARCH: arm64
-  SUBARCH: arm64
   KBUILD_BUILD_USER: github-actions
   KBUILD_BUILD_HOST: x6815c-ci
   TZ: Asia/Karachi
   CCACHE_DIR: /home/runner/.ccache
   CCACHE_COMPRESS: "1"
+  CCACHE_MAXSIZE: 5G
+  # Required by Android netd / eBPF on a 4.19 kernel
   BPF_REQUIRED: "BPF BPF_SYSCALL BPF_JIT CGROUP_BPF NET_CLS_BPF NET_ACT_BPF NET_CLS_ACT NET_SCH_INGRESS NETFILTER_XT_MATCH_BPF"
   BPF_OPTIONAL: "BPF_JIT_ALWAYS_ON BPF_EVENTS"
 
@@ -61,21 +57,30 @@ jobs:
   build:
     name: Build kernel
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Checkout workflow repo
         uses: actions/checkout@v4
 
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
       - name: Install dependencies
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache cpio curl flex git libssl-dev \
-            libelf-dev libncurses-dev lz4 python3 rsync unzip zip xz-utils \
+            bc bison build-essential ccache cpio curl flex git kmod \
+            libssl-dev libelf-dev libncurses-dev lz4 perl python3 \
+            python-is-python3 rsync unzip zip xz-utils zstd \
             device-tree-compiler binutils-aarch64-linux-gnu \
             binutils-arm-linux-gnueabi gcc-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi zstd
+            gcc-arm-linux-gnueabi
+          # Old prebuilt AOSP clang may want these; not present on every image
+          sudo apt-get install -y --no-install-recommends libtinfo5 libncurses5 || true
 
       - name: Clone kernel source
         env:
@@ -87,25 +92,20 @@ jobs:
           else
             git clone --depth=1 "$REPO" kernel
           fi
+          git -C kernel log -1 --oneline
 
       - name: Resolve defconfig
         working-directory: kernel
         env:
           INPUT_DEFCONFIG: ${{ inputs.defconfig }}
         run: |
-          echo "Available defconfigs matching x6815c / 6877:"
+          echo "Defconfigs matching x6815c / 6877:"
           ls arch/arm64/configs | grep -iE 'x6815c|6877' || echo "(none)"
 
           DC="$INPUT_DEFCONFIG"
-          if [ -z "$DC" ]; then
-            DC=$(ls arch/arm64/configs | grep -iE 'x6815c' | head -n1 || true)
-          fi
-          if [ -z "$DC" ]; then
-            DC=$(ls arch/arm64/configs | grep -iE '6877' | head -n1 || true)
-          fi
-          if [ -z "$DC" ]; then
-            DC=$(ls arch/arm64/configs | grep -iE 'defconfig' | head -n1 || true)
-          fi
+          [ -z "$DC" ] && [ -f arch/arm64/configs/X6815C_defconfig ] && DC=X6815C_defconfig
+          [ -z "$DC" ] && DC=$(ls arch/arm64/configs | grep -iE 'x6815c' | head -n1 || true)
+          [ -z "$DC" ] && DC=$(ls arch/arm64/configs | grep -iE '6877.*_defconfig$' | grep -v debug | head -n1 || true)
           if [ -z "$DC" ] || [ ! -f "arch/arm64/configs/$DC" ]; then
             echo "::error::Defconfig not found. Set the 'defconfig' input."
             ls arch/arm64/configs/
@@ -121,13 +121,24 @@ jobs:
           set -o pipefail
           OK=0
           if [ "$TOOLCHAIN" = "aosp" ]; then
-            mkdir -p "$HOME/clang"
-            URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902.tar.gz"
-            if curl -fsSL --retry 3 "$URL" | tar -xz -C "$HOME/clang" && [ -x "$HOME/clang/bin/clang" ]; then
-              OK=1
-              echo "Using AOSP clang r383902"
-            else
-              echo "::warning::AOSP clang download failed, falling back to Proton-Clang"
+            # The stock X6815C kernel was built with AOSP clang r383902 (11.0.1).
+            BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads"
+            for REF in android11-release android11-qpr3-release android11-qpr2-release \
+                       android11-qpr1-release master-kernel-build-2021; do
+              rm -rf "$HOME/clang"; mkdir -p "$HOME/clang"
+              echo "Trying $REF ..."
+              if curl -fsSL --retry 3 --max-time 900 "$BASE/$REF/clang-r383902.tar.gz" -o /tmp/clang.tgz \
+                 && tar -xzf /tmp/clang.tgz -C "$HOME/clang" \
+                 && [ -x "$HOME/clang/bin/clang" ] \
+                 && "$HOME/clang/bin/clang" --version | head -n1 | grep -q '11\.0\.1'; then
+                OK=1
+                echo "Using AOSP clang r383902 from $REF"
+                break
+              fi
+            done
+            rm -f /tmp/clang.tgz
+            if [ "$OK" -eq 0 ]; then
+              echo "::warning::AOSP clang r383902 could not be downloaded, falling back to Proton-Clang (not the stock compiler; vendor module ABI may differ)"
               rm -rf "$HOME/clang"
             fi
           fi
@@ -136,27 +147,46 @@ jobs:
           fi
           echo "$HOME/clang/bin" >> "$GITHUB_PATH"
           "$HOME/clang/bin/clang" --version | head -n1
+          "$HOME/clang/bin/ld.lld" --version | head -n1
+
+      - name: Set up ccache and make wrapper
+        run: |
+          # ccache masquerade: a 'clang' symlink to ccache placed ahead of the real clang
+          mkdir -p "$HOME/ccache-bin"
+          ln -sf "$(command -v ccache)" "$HOME/ccache-bin/clang"
+          echo "$HOME/ccache-bin" >> "$GITHUB_PATH"
+
+          # One shared make wrapper so configure, build and every later step
+          # use identical variables. This old MediaTek tree assigns CC internally
+          # and its connectivity modules need these variables on the command line.
+          cat > "$RUNNER_TEMP/kmake.sh" <<'EOF'
+          kmake() {
+            make O=out ARCH=arm64 SUBARCH=arm64 \
+              CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+              OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+              HOSTCC=gcc HOSTCXX=g++ \
+              CLANG_TRIPLE=aarch64-linux-gnu- \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+              TARGET_BUILD_VARIANT=userdebug \
+              CONFIG_MTK_COMBO_WIFI_HIF=axi MTK_COMBO_CHIP=CONNAC2X2_SOC5_0 \
+              BT_PLATFORM=6877 WLAN_CHIP_ID=6877 \
+              MTK_ANDROID_WMT=y MTK_ANDROID_EMI=y WIFI_IP_SET=1 \
+              MTK_WLAN_SERVICE=yes CONNAC_VER=2_0 CFG_BUILD_CONNAC2=true \
+              KCFLAGS="-Wno-error -Wno-deprecated-declarations" \
+              "$@"
+          }
+          EOF
+          echo "KMAKE_ENV=$RUNNER_TEMP/kmake.sh" >> "$GITHUB_ENV"
+          bash -n "$RUNNER_TEMP/kmake.sh"
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        id: ccache
+        uses: actions/cache/restore@v4
         with:
           path: ~/.ccache
           key: ccache-x6815c-${{ github.run_id }}
           restore-keys: ccache-x6815c-
-
-      - name: Optional WLAN/HIF fix
-        if: ${{ inputs.wlan_fix }}
-        working-directory: kernel
-        run: |
-          WLAN_MK="drivers/misc/mediatek/connectivity/wlan/core/gen4m/Makefile"
-          if [ -f "$WLAN_MK" ]; then
-            sed -i 's/^WLAN_CHIP_ID.*/WLAN_CHIP_ID = MT6632/' "$WLAN_MK"
-            sed -i 's/^HIF.*/HIF = sdio/' "$WLAN_MK"
-            sed -i 's/^CONFIG_MTK_COMBO_WIFI_HIF.*/CONFIG_MTK_COMBO_WIFI_HIF = sdio/' "$WLAN_MK"
-            echo "WLAN Makefile patched."
-          else
-            echo "::warning::WLAN Makefile not found, skipping."
-          fi
 
       - name: Apply BPF patches (optional, patches/bpf/*.patch)
         if: ${{ inputs.enable_bpf }}
@@ -182,36 +212,48 @@ jobs:
         working-directory: kernel
         env:
           BPF: ${{ inputs.enable_bpf }}
-          WLAN_FIX: ${{ inputs.wlan_fix }}
         run: |
+          source "$KMAKE_ENV"
+
+          # CI-only tweaks. Do NOT force LTO_NONE: the X6815C config uses ThinLTO + CFI
+          # (CFI depends on LTO_CLANG) and the stock vendor modules expect that ABI.
           : > ci.config
-          {
-            echo 'CONFIG_MODULE_SIG=n'
-            echo 'CONFIG_SYSTEM_TRUSTED_KEYS=""'
-            echo 'CONFIG_DEBUG_INFO=n'
-            echo 'CONFIG_LTO_NONE=y'
-          } >> ci.config
-
-          if [ "$WLAN_FIX" = "true" ]; then
-            {
-              echo 'CONFIG_MTK_COMBO_WIFI_HIF="sdio"'
-              echo 'CONFIG_MTK_COMBO_CHIP="MT6632"'
-            } >> ci.config
-          fi
-
+          echo 'CONFIG_DEBUG_INFO=n' >> ci.config
           if [ "$BPF" = "true" ]; then
             for c in $BPF_REQUIRED $BPF_OPTIONAL; do
               echo "CONFIG_${c}=y" >> ci.config
             done
           fi
 
-          make O=out ARCH=arm64 CC=clang "$DEFCONFIG"
-          scripts/kconfig/merge_config.sh -m -O out out/.config ci.config
-          make O=out ARCH=arm64 CC=clang olddefconfig
+          kmake "$DEFCONFIG"
+
+          FRAGS=()
+          # The port's own fragment (ACCDET dup-symbol fix, MI_HARDWARE_ID / get_hw_sku, SCS off, ...)
+          [ -f x6815c-port/configs/X6815C_lineage.config ] && FRAGS+=(x6815c-port/configs/X6815C_lineage.config)
+          FRAGS+=(ci.config)
+          scripts/kconfig/merge_config.sh -m -O out out/.config "${FRAGS[@]}"
+          kmake olddefconfig
+
+          FAIL=0
+          {
+            echo "### Config check"
+            echo "defconfig: \`$DEFCONFIG\`  fragments: \`${FRAGS[*]}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Invariants for the stock vendor modules / boot to keep working
+          if ! grep -q '^# CONFIG_SHADOW_CALL_STACK is not set' out/.config; then
+            echo "::error::CONFIG_SHADOW_CALL_STACK must be off (breaks prebuilt bt_drv_6877.ko via x18)"
+            FAIL=1
+          fi
+          for c in LTO_CLANG CFI_CLANG MODULES MODVERSIONS; do
+            if ! grep -q "^CONFIG_${c}=y" out/.config; then
+              echo "::error::CONFIG_${c} is not enabled (stock ABI expects it)"
+              FAIL=1
+            fi
+          done
 
           if [ "$BPF" = "true" ]; then
-            MISSING=0
-            echo "### BPF config check" >> "$GITHUB_STEP_SUMMARY"
+            echo "#### BPF" >> "$GITHUB_STEP_SUMMARY"
             for c in $BPF_REQUIRED; do
               if grep -q "^CONFIG_${c}=y" out/.config; then
                 echo "OK      CONFIG_${c}"
@@ -220,38 +262,41 @@ jobs:
                 echo "::error::CONFIG_${c} did not stick after olddefconfig"
                 grep -E "(^| )CONFIG_${c}[ =]" out/.config || echo "  symbol not in .config at all (missing in Kconfig or unmet dependency)"
                 echo "- MISSING: CONFIG_${c}" >> "$GITHUB_STEP_SUMMARY"
-                MISSING=1
+                FAIL=1
               fi
             done
             for c in $BPF_OPTIONAL; do
-              if ! grep -q "^CONFIG_${c}=y" out/.config; then
-                echo "::warning::Optional CONFIG_${c} is not enabled"
-              fi
+              grep -q "^CONFIG_${c}=y" out/.config || echo "::warning::Optional CONFIG_${c} is not enabled"
             done
-            if [ "$MISSING" -ne 0 ]; then
-              echo "::error::Required BPF configs missing. Stopping before the long build."
-              exit 1
-            fi
+          fi
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::Config checks failed. Stopping before the long build."
+            exit 1
           fi
 
       - name: Build kernel
         working-directory: kernel
+        env:
+          INC_DTB: ${{ inputs.include_dtb }}
         run: |
           set -o pipefail
-          ccache -M 4G
+          source "$KMAKE_ENV"
           ccache -z
 
-          make -j"$(nproc)" O=out ARCH=arm64 \
-            CC="ccache clang" \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
-            OBJDUMP=llvm-objdump STRIP=llvm-strip \
-            KCFLAGS="-Wno-error -Wno-deprecated-declarations" \
-            2>&1 | tee build.log
+          TARGETS=(Image.gz modules)
+          [ "$INC_DTB" = "true" ] && TARGETS+=(dtbs)
+
+          kmake -j"$(nproc)" "${TARGETS[@]}" 2>&1 | tee build.log
 
           ccache -s
+
+      - name: Save ccache
+        if: always() && steps.ccache.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-x6815c-${{ github.run_id }}
 
       - name: Collect outputs
         working-directory: kernel
@@ -283,29 +328,41 @@ jobs:
               cp "$DTB" "$D/dtb"
               echo "Collected dtb: $DTB"
             else
-              echo "::warning::include_dtb is on but no mt6877*.dtb was found"
+              echo "::warning::include_dtb is on but no mt6877*.dtb was found; keeping the repo dtb"
             fi
           fi
 
           if [ "$INC_MODULES" = "true" ]; then
             mkdir -p "$D/modules"
             find out -name '*.ko' -exec cp {} "$D/modules/" \;
+            ls "$D/modules"
           fi
 
           cp out/.config "$D/final.config"
+          [ -f out/Module.symvers ] && cp out/Module.symvers "$D/Module.symvers"
           echo "KVER=$(make -s kernelversion)" >> "$GITHUB_ENV"
 
       - name: Package AnyKernel3
+        working-directory: ${{ github.workspace }}
         env:
           INC_MODULES: ${{ inputs.include_modules }}
           BPF: ${{ inputs.enable_bpf }}
         run: |
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
-          rm -rf ak3/.git ak3/.github ak3/README.md
           D="$GITHUB_WORKSPACE/dist"
 
+          # Prefer the AnyKernel3 shipped in the kernel repo: it already has the
+          # X6815C device names, banner and the grounded dtb. Fall back to upstream.
+          if [ -f kernel/AnyKernel3/anykernel.sh ]; then
+            cp -r kernel/AnyKernel3 ak3
+          else
+            git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          fi
+          rm -rf ak3/.git ak3/.github ak3/README.md
+
+          # drop any stale kernel image / dtb the template shipped, then add ours
+          rm -f ak3/Image ak3/Image.gz ak3/Image.gz-dtb
           cp "$D/$KIMG" ak3/
-          [ -f "$D/dtb" ] && cp "$D/dtb" ak3/
+          [ -f "$D/dtb" ] && cp "$D/dtb" ak3/dtb
 
           MODFLAG=0
           if [ "$INC_MODULES" = "true" ] && ls "$D"/modules/*.ko >/dev/null 2>&1; then
@@ -318,21 +375,29 @@ jobs:
           [ "$BPF" = "true" ] && TAG="-BPF"
 
           sed -i \
-            -e "s|^kernel.string=.*|kernel.string=X6815C ${KVER}${TAG}|" \
-            -e "s|^do.devicecheck=.*|do.devicecheck=0|" \
+            -e "s|^kernel.string=.*|kernel.string=X6815C ${KVER}${TAG} (run ${GITHUB_RUN_NUMBER})|" \
             -e "s|^do.modules=.*|do.modules=${MODFLAG}|" \
             -e "s|^do.cleanup=.*|do.cleanup=1|" \
-            -e "s|^BLOCK=.*|BLOCK=boot;|" \
-            -e "s|^IS_SLOT_DEVICE=.*|IS_SLOT_DEVICE=auto;|" \
-            -e "s|^RAMDISK_COMPRESSION=.*|RAMDISK_COMPRESSION=auto;|" \
-            -e "s|^PATCH_VBMETA_FLAG=.*|PATCH_VBMETA_FLAG=auto;|" \
             ak3/anykernel.sh
 
-          grep -E '^(kernel.string|do.devicecheck|do.modules|do.cleanup|BLOCK|IS_SLOT_DEVICE|RAMDISK_COMPRESSION|PATCH_VBMETA_FLAG)=' ak3/anykernel.sh
+          grep -E '^(kernel.string|do.devicecheck|do.modules|do.cleanup|BLOCK|IS_SLOT_DEVICE|RAMDISK_COMPRESSION|PATCH_VBMETA_FLAG)=' ak3/anykernel.sh || true
 
           ZIP="X6815C-${KVER}${TAG}-run${GITHUB_RUN_NUMBER}.zip"
           (cd ak3 && zip -r9 "$D/$ZIP" . -x '*.git*')
+          unzip -l "$D/$ZIP" | tail -n 25
           echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Show first build errors
+        if: failure()
+        run: |
+          if [ -f kernel/build.log ]; then
+            {
+              echo "### First errors in build.log"
+              echo '```'
+              grep -nE 'error:|\*\*\*|undefined symbol|duplicate symbol|No rule to make' kernel/build.log | head -n 30
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
